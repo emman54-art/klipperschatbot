@@ -11,6 +11,14 @@
  * In index.html: <script src="js/chat.js" data-api-url="/api/chat"></script>
  *
  * Optional grounding: CHAT_SOURCES = comma-separated URLs (Google Maps, Facebook, etc.).
+ * Groq free/on-demand tiers have strict TPM — keep payloads small. Override sizes if needed:
+ * - CHAT_GROUNDING_MAX_PER_SOURCE (chars per URL excerpt, default 1200 for Groq, 6000 otherwise)
+ * - CHAT_GROUNDING_MAX_TOTAL (chars for all sources combined, default 2800 for Groq, 12000 otherwise)
+ * - CHAT_HISTORY_MAX_TURNS (default 6), CHAT_MESSAGE_MAX_CHARS (default 1200 per turn)
+ *
+ * Groq free tier TPM is tight: external page grounding is OFF by default for provider=groq.
+ * Set CHAT_GROUNDING=1 (or true) on Vercel to enable Google/Facebook fetch for Groq.
+ * OpenAI: grounding stays on unless CHAT_GROUNDING=0.
  */
 
 // Very small in-memory cache (per serverless instance)
@@ -53,7 +61,8 @@ function truncate(s, maxChars) {
   return s.slice(0, maxChars) + '\n[truncated]';
 }
 
-async function fetchPublicPageText(url) {
+async function fetchPublicPageText(url, maxTextChars) {
+  maxTextChars = maxTextChars || 12000;
   var controller = new AbortController();
   var timeout = setTimeout(function () {
     controller.abort();
@@ -76,10 +85,9 @@ async function fetchPublicPageText(url) {
 
     // Limit total bytes read to avoid huge pages (Google can be massive)
     var raw = await r.text();
-    raw = truncate(raw, 200000);
+    raw = truncate(raw, 120000);
     var text = stripHtmlToText(raw);
-    // Keep the excerpt modest so the model stays focused
-    text = truncate(text, 12000);
+    text = truncate(text, maxTextChars);
     return { url: url, ok: true, status: r.status, text: text };
   } catch (e) {
     return { url: url, ok: false, status: 0, text: '' };
@@ -88,8 +96,37 @@ async function fetchPublicPageText(url) {
   }
 }
 
-async function getGroundingText(sources) {
-  var sourcesKey = sources.join(',');
+function groundingLimits(provider) {
+  var envTotal = parseInt(String(process.env.CHAT_GROUNDING_MAX_TOTAL || '').trim(), 10);
+  var envPer = parseInt(String(process.env.CHAT_GROUNDING_MAX_PER_SOURCE || '').trim(), 10);
+  var def =
+    provider === 'groq'
+      ? { perSource: 1200, total: 2800 }
+      : { perSource: 6000, total: 12000 };
+  return {
+    perSource: !isNaN(envPer) && envPer > 0 ? envPer : def.perSource,
+    total: !isNaN(envTotal) && envTotal > 0 ? envTotal : def.total,
+  };
+}
+
+function trimMessagesForLlm(messages, provider) {
+  var maxTurns = parseInt(String(process.env.CHAT_HISTORY_MAX_TURNS || '').trim(), 10);
+  var maxChars = parseInt(String(process.env.CHAT_MESSAGE_MAX_CHARS || '').trim(), 10);
+  if (isNaN(maxTurns) || maxTurns < 1) maxTurns = provider === 'groq' ? 6 : 10;
+  if (isNaN(maxChars) || maxChars < 100) maxChars = provider === 'groq' ? 1200 : 4000;
+
+  var slice = messages.slice(-maxTurns);
+  return slice.map(function (m) {
+    var c = String(m.content || '');
+    if (c.length > maxChars) c = c.slice(0, maxChars) + '…';
+    var role = m.role === 'user' ? 'user' : 'assistant';
+    return { role: role, content: c };
+  });
+}
+
+async function getGroundingText(sources, limits) {
+  limits = limits || { perSource: 1200, total: 2800 };
+  var sourcesKey = sources.join(',') + '|' + limits.perSource + '|' + limits.total;
   var now = Date.now();
   // Cache for 10 minutes per instance
   if (_cache.text && _cache.sources === sourcesKey && now - _cache.at < 10 * 60 * 1000) {
@@ -98,7 +135,7 @@ async function getGroundingText(sources) {
 
   var results = await Promise.all(
     sources.map(function (u) {
-      return fetchPublicPageText(u);
+      return fetchPublicPageText(u, limits.perSource);
     })
   );
 
@@ -112,8 +149,7 @@ async function getGroundingText(sources) {
     })
     .join('\n\n---\n\n');
 
-  // Keep overall grounding bounded
-  combined = truncate(combined, 18000);
+  combined = truncate(combined, limits.total);
 
   _cache.at = now;
   _cache.sources = sourcesKey;
@@ -183,6 +219,9 @@ module.exports = async function handler(req, res) {
   var body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
   var messages = body.messages;
   var context = body.context || '';
+  if (llm.provider === 'groq' && context.length > 2500) {
+    context = context.slice(0, 2500) + '…';
+  }
 
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: 'messages array required' });
@@ -204,11 +243,21 @@ module.exports = async function handler(req, res) {
       .filter(Boolean);
   }
 
+  var gLimits = groundingLimits(llm.provider);
   var grounding = '';
-  try {
-    grounding = await getGroundingText(sources);
-  } catch (e) {
-    grounding = '';
+  var gFlag = String(process.env.CHAT_GROUNDING || '').trim().toLowerCase();
+  var fetchGrounding = true;
+  if (llm.provider === 'groq') {
+    fetchGrounding = gFlag === '1' || gFlag === 'true' || gFlag === 'yes';
+  } else {
+    fetchGrounding = gFlag !== '0' && gFlag !== 'false' && gFlag !== 'no';
+  }
+  if (fetchGrounding) {
+    try {
+      grounding = await getGroundingText(sources, gLimits);
+    } catch (e) {
+      grounding = '';
+    }
   }
 
   var system =
@@ -222,13 +271,9 @@ module.exports = async function handler(req, res) {
     '\n\nGrounded sources (may be partial if a site blocks scraping):\n' +
     (grounding || '[No source text available]');
 
-  var openaiMessages = [{ role: 'system', content: system }].concat(
-    messages.map(function (m) {
-      var role = m.role === 'user' ? 'user' : 'assistant';
-      return { role: role, content: String(m.content || '') };
-    })
-  );
+  var openaiMessages = [{ role: 'system', content: system }].concat(trimMessagesForLlm(messages, llm.provider));
 
+  var maxOut = llm.provider === 'groq' ? 320 : 500;
   try {
     var r = await fetch(llm.url, {
       method: 'POST',
@@ -239,7 +284,7 @@ module.exports = async function handler(req, res) {
       body: JSON.stringify({
         model: llm.model,
         messages: openaiMessages,
-        max_tokens: 500,
+        max_tokens: maxOut,
         temperature: 0.7,
       }),
     });
