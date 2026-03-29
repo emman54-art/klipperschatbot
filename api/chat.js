@@ -1,13 +1,16 @@
 /**
  * Vercel Serverless Function — real AI replies (optional).
  *
- * 1. Deploy this site to Vercel (include the /api folder).
- * 2. Vercel → Settings → Environment Variables: OPENAI_API_KEY = sk-...
- * 3. In index.html: <script src="js/chat.js" data-api-url="/api/chat"></script>
+ * LLM providers (set one API key):
+ * - Groq (recommended if OpenAI quota is an issue): GROQ_API_KEY
+ *   https://console.groq.com/keys — optional GROQ_MODEL (default: llama-3.1-8b-instant)
+ * - OpenAI: OPENAI_API_KEY — optional OPENAI_MODEL (default: gpt-4o-mini)
  *
- * Optional grounding sources (public pages):
- * - CHAT_SOURCES: comma-separated URLs to fetch and use as context (ex: Google Maps listing, Facebook page).
- *   If omitted, defaults to Klippers' Facebook + Google Maps URLs already used in index.html JSON-LD.
+ * CHAT_LLM_PROVIDER: groq | openai — if unset, uses Groq when GROQ_API_KEY is set, else OpenAI.
+ *
+ * In index.html: <script src="js/chat.js" data-api-url="/api/chat"></script>
+ *
+ * Optional grounding: CHAT_SOURCES = comma-separated URLs (Google Maps, Facebook, etc.).
  */
 
 // Very small in-memory cache (per serverless instance)
@@ -119,15 +122,62 @@ async function getGroundingText(sources) {
   return combined;
 }
 
+/**
+ * Pick Groq or OpenAI. Groq uses OpenAI-compatible /v1/chat/completions.
+ */
+function getLlmConfig() {
+  var force = String(process.env.CHAT_LLM_PROVIDER || '').trim().toLowerCase();
+  var groqKey = process.env.GROQ_API_KEY;
+  var openaiKey = process.env.OPENAI_API_KEY;
+
+  if (force === 'groq') {
+    if (!groqKey) return null;
+    return {
+      provider: 'groq',
+      url: 'https://api.groq.com/openai/v1/chat/completions',
+      key: groqKey,
+      model: String(process.env.GROQ_MODEL || 'llama-3.1-8b-instant').trim(),
+    };
+  }
+  if (force === 'openai') {
+    if (!openaiKey) return null;
+    return {
+      provider: 'openai',
+      url: 'https://api.openai.com/v1/chat/completions',
+      key: openaiKey,
+      model: String(process.env.OPENAI_MODEL || 'gpt-4o-mini').trim(),
+    };
+  }
+  if (groqKey) {
+    return {
+      provider: 'groq',
+      url: 'https://api.groq.com/openai/v1/chat/completions',
+      key: groqKey,
+      model: String(process.env.GROQ_MODEL || 'llama-3.1-8b-instant').trim(),
+    };
+  }
+  if (openaiKey) {
+    return {
+      provider: 'openai',
+      url: 'https://api.openai.com/v1/chat/completions',
+      key: openaiKey,
+      model: String(process.env.OPENAI_MODEL || 'gpt-4o-mini').trim(),
+    };
+  }
+  return null;
+}
+
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  var key = process.env.OPENAI_API_KEY;
-  if (!key) {
-    return res.status(503).json({ error: 'OPENAI_API_KEY not configured' });
+  var llm = getLlmConfig();
+  if (!llm) {
+    return res.status(503).json({
+      error: 'No LLM configured — set GROQ_API_KEY and/or OPENAI_API_KEY in Vercel Environment Variables',
+    });
   }
 
   var body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
@@ -180,14 +230,14 @@ module.exports = async function handler(req, res) {
   );
 
   try {
-    var r = await fetch('https://api.openai.com/v1/chat/completions', {
+    var r = await fetch(llm.url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: 'Bearer ' + key,
+        Authorization: 'Bearer ' + llm.key,
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: llm.model,
         messages: openaiMessages,
         max_tokens: 500,
         temperature: 0.7,
@@ -196,7 +246,7 @@ module.exports = async function handler(req, res) {
 
     var data = await r.json();
     if (!r.ok) {
-      console.error('OpenAI error', data);
+      console.error(llm.provider + ' LLM error', data);
       return res.status(502).json({ error: 'AI service error' });
     }
 
